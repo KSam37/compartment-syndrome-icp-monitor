@@ -1,6 +1,6 @@
 # ICP Monitor — Intracompartmental Pressure Monitoring Device
 
-A wireless pressure monitoring system for intracompartmental pressure (ICP) measurement built for MIT 2.75 Medical Device Design. The device reads pressure via I2C from a Honeywell ABP2 sensor, filters the signal, and streams data in real time to a web dashboard served directly from the ESP32 over WiFi. No app installation is required — any device with a browser can connect.
+A wireless pressure monitoring system for intracompartmental pressure (ICP) measurement built for MIT 2.75 Medical Device Design. The device reads pressure from a Honeywell ABP2 sensor via I2C, filters the signal, and streams data in real time to a web dashboard served directly from the ESP32 over its own WiFi network. No app installation is required — any device with a browser (iPhone, Android, laptop) can connect.
 
 ---
 
@@ -25,10 +25,12 @@ D4 (SDA)      ──────►  SDA
 D5 (SCL)      ──────►  SCL
 ```
 
+> The ABP2 requires I2C pull-up resistors. If your breakout does not include them, add 4.7 kΩ resistors from SDA→3.3V and SCL→3.3V.
+
 ### Power
 
-- **USB-C**: Powers the board and charges the LiPo battery simultaneously via the onboard SGM40567 charge management IC (100 mA charge current).
-- **Battery only**: Connect a 3.7V LiPo to the B+/B− pads. The board boots automatically on power application — no button press needed.
+- **USB-C**: Powers the board and charges the LiPo simultaneously via the onboard SGM40567 charge IC (100 mA charge current).
+- **Battery only**: Connect a 3.7V LiPo to the B+/B− pads on the underside. The board boots automatically on power-up — no button press needed.
 - **RESET button**: Restarts firmware. **BOOT button**: Hold while pressing RESET only when reflashing a bricked device.
 
 ---
@@ -40,9 +42,9 @@ D5 (SCL)      ──────►  SCL
 ```
 ICP_Monitor/
 ├── ICP_Monitor.ino     Main firmware — setup/loop, orchestration
-├── config.h            All pin definitions, constants, and tunable parameters
-├── sensor.h/.cpp       Pressure sensor I2C driver
-├── filter.h/.cpp       Rolling average + spike rejection filter
+├── config.h            Pin definitions, constants, and default parameters
+├── sensor.h/.cpp       Honeywell ABP2 I2C driver
+├── filter.h/.cpp       5-sample median filter (runtime-adjustable window)
 ├── battery.h/.cpp      Battery voltage monitoring
 ├── webserver.h/.cpp    WiFi AP, HTTP server, WebSocket, captive portal
 └── dashboard.h         Complete web UI embedded as a PROGMEM string literal
@@ -52,118 +54,116 @@ ICP_Monitor/
 
 ```
 Honeywell ABP2 (I2C)
-        │  7-byte response @ 10 Hz
+        │  7-byte response @ configurable rate (default 10 Hz)
         ▼
   sensor.cpp
-  sensorRead()          → raw 24-bit pressure counts + temperature counts
+  sensorRead()          → raw 24-bit counts, SensorResult enum
         │
         ▼  Transfer function → PSI → mmHg − zero offset
   filter.cpp
-  filterSample()        → rolling average + spike rejection
+  filterSample()        → median of last N samples (default N=5)
         │
         ▼
-  ICP_Monitor.ino       → broadcast JSON via WebSocket @ 10 Hz
+  ICP_Monitor.ino       → build JSON, broadcast via WebSocket
         │
         ▼
   webserver.cpp
   ws.textAll(json)      → push to all connected browser clients
         │
         ▼
-  dashboard.h (JS)      → update live display + chart + alert check
+  dashboard.h (JS)      → update display, chart, alerts, prototyping panel
 ```
 
-### Module Descriptions
+---
 
-#### `config.h`
-Central configuration header. All tunable parameters live here — no magic numbers elsewhere.
+## Module Descriptions
 
-Key constants:
+### `config.h`
+Central configuration header. All tunable defaults live here.
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `SENSOR_INTERVAL_MS` | 100 | Sensor poll period (ms). 100 = 10 Hz |
-| `FILTER_WINDOW` | 10 | Rolling average window in samples (= 1 s at 10 Hz) |
-| `SPIKE_THRESHOLD_MMHG` | 15.0 | Max allowed single-sample jump (mmHg) before rejection |
-| `AP_SSID` | "ICP-Monitor" | WiFi network name |
-| `AP_PASSWORD` | "pressure" | WiFi password |
+| `SENSOR_INTERVAL_MS` | 100 | Default poll period (ms). 100 = 10 Hz. Adjustable at runtime from the dashboard. |
+| `FILTER_MAX_WINDOW` | 21 | Hard maximum for filter window (sets array size) |
+| `FILTER_DEFAULT_WINDOW` | 5 | Window size on startup. Adjustable at runtime. |
+| `AP_SSID` | `"ICP-Monitor"` | WiFi network name |
+| `AP_PASSWORD` | `"pressure"` | WiFi password |
 | `BAT_VOLT_FULL` | 4.2 V | LiPo full voltage |
 | `BAT_VOLT_EMPTY` | 3.0 V | LiPo empty voltage |
+| `BATTERY_INTERVAL_MS` | 5000 | Battery read period (ms) |
 
-#### `sensor.h/.cpp`
-Encapsulates all communication with the Honeywell ABP2 sensor.
+---
+
+### `sensor.h/.cpp`
+Encapsulates all communication with the Honeywell ABP2.
 
 **Protocol**: I2C at address `0x28`. Each measurement cycle:
-1. Write 3-byte command `[0xAA, 0x00, 0x00]` to trigger a conversion.
-2. Wait 10 ms for the sensor ASIC to complete the measurement.
+1. Write 3-byte command `[0xAA, 0x00, 0x00]` to trigger conversion.
+2. Wait 10 ms for the sensor ASIC.
 3. Read 7 bytes: `[status, P[23:16], P[15:8], P[7:0], T[23:16], T[15:8], T[7:0]]`.
-4. Validate status byte: `0x40` = powered on and not busy. Any other value = error or busy.
+4. Validate status byte: `0x40` = powered on and not busy.
 
 **Transfer function** (Honeywell ABP2 datasheet, 10%–90% calibration):
 ```
 pressure_psi = ((counts − OUT_MIN) × (P_MAX − P_MIN)) / (OUT_MAX − OUT_MIN) + P_MIN
 
-where:
   OUT_MIN = 1,677,722   (10% × 2^24)
   OUT_MAX = 15,099,494  (90% × 2^24)
-  P_MIN   = 0.0 psi
-  P_MAX   = 1.0 psi
+  P_MIN   = 0.0 psi,  P_MAX = 1.0 psi
 ```
 
-**Temperature** (standard ABP2 formula):
+**Temperature**:
 ```
 temp_c = (counts × 200) / 16,777,215 − 50
 ```
 
-**Return values** (`SensorResult` enum):
+**`SensorResult` enum**:
 
 | Value | Meaning |
 |-------|---------|
 | `SENSOR_OK` | Valid reading |
 | `SENSOR_ERROR` | I2C failure or bad status byte |
-| `SENSOR_OVERRANGE` | Pressure counts ≥ `OUT_MAX` (above 1 PSI = 51.7 mmHg) |
-| `SENSOR_UNDERRANGE` | Pressure counts ≤ `OUT_MIN` (below 0 PSI) |
+| `SENSOR_OVERRANGE` | Counts ≥ OUT_MAX (above 1 PSI / 51.7 mmHg) |
+| `SENSOR_UNDERRANGE` | Counts ≤ OUT_MIN (below 0 PSI) |
 
 **Unit conversion**: `1 PSI = 51.7149 mmHg`
 
-#### `filter.h/.cpp`
-Two-stage signal conditioning applied to every valid pressure reading.
+---
 
-**Stage 1 — Spike Rejection**
+### `filter.h/.cpp`
+A median filter applied to every valid pressure reading after the zero offset is subtracted.
 
-Before updating the rolling average, the incoming sample is compared against the current average:
-```
-if |newSample − currentAverage| > SPIKE_THRESHOLD_MMHG:
-    discard newSample, return currentAverage unchanged
-```
-This prevents electrical transients or I2C glitches from corrupting the display. The threshold (15 mmHg default) is configurable in `config.h`.
+**How it works**: A circular buffer of the last N samples is maintained. On each new sample, a temporary sorted copy is produced via insertion sort (≤ N² / 2 comparisons — negligible on ESP32 for N ≤ 21), and the middle element is returned.
 
-**Stage 2 — Rolling Average**
+**Why median**:
+- A single erroneous sample (I2C glitch, electrical transient) can only become the median if it represents the majority of the buffer — a single bad read is invisible.
+- Unlike threshold-based spike rejection, there is no parameter to tune and no risk of suppressing a real rapid pressure change. If pressure genuinely changes, the majority of the buffer follows and the median tracks it immediately.
+- Unlike a rolling average, spikes do not bleed proportionally into the output.
 
-A circular buffer of `FILTER_WINDOW` samples is maintained. The output is the mean of all samples currently in the buffer:
-```
-output = sum(buf[0..N−1]) / N
-```
-At 10 Hz with a window of 10 samples, this produces a 1-second moving average, suppressing physiological noise and sensor quantization noise without introducing clinically meaningful lag.
+**Runtime adjustment**: The window size is adjustable from the Prototyping Panel without reflashing. `filterSetWindow(n)` enforces odd values (required for a unique median) and resets the buffer. The maximum window is `FILTER_MAX_WINDOW` (21 samples).
 
-`filterReady()` returns false until the buffer is at least half full, preventing the display of misleadingly smooth values during the first 500 ms of operation.
+The filter is also reset on zero/tare so the new baseline is established from fresh samples only.
 
-The filter is reset (`filterInit()`) when a zero/tare command is issued, ensuring the new baseline is established from fresh samples only.
+---
 
-#### `battery.h/.cpp`
-Reads battery voltage from the ADC pin on the XIAO ESP32-C5.
+### `battery.h/.cpp`
+Reads battery voltage via the ADC on the XIAO ESP32-C5.
 
-The board contains a 1:2 resistor voltage divider (two 100 kΩ resistors) connecting the battery positive terminal to the ADC input. 16 ADC samples are averaged using `analogReadMilliVolts()` for stability, then the result is multiplied by 2 to recover the actual battery voltage.
+The board has a 1:2 resistor voltage divider (two 100 kΩ) connecting battery+ to the ADC input. 16 samples are averaged using `analogReadMilliVolts()`, then multiplied by 2 to recover actual voltage.
 
-Battery percentage is derived from a linear interpolation between 3.0 V (0%) and 4.2 V (100%). If the measured voltage is below 2.5 V (indicating no battery is connected and the pin is floating), `batteryPercent()` returns `−1` and the dashboard displays "USB" instead of a percentage.
+- Battery % is a linear interpolation: 3.0 V = 0%, 4.2 V = 100%.
+- If voltage < 2.5 V (pin floating, no LiPo connected), `batteryPercent()` returns `−1` and the dashboard shows **USB ⚡** instead of a percentage.
+- Charging is inferred when voltage > 4.15 V.
+- Battery is sampled every 5 seconds to avoid ADC contention with the main loop.
 
-Battery is sampled every 5 seconds (`BATTERY_INTERVAL_MS`) since it changes slowly and ADC sampling introduces a brief interrupt in the main loop.
+---
 
-#### `webserver.h/.cpp`
-Manages the WiFi access point, HTTP server, WebSocket server, and captive portal.
+### `webserver.h/.cpp`
+Manages the WiFi access point, HTTP server, WebSocket, and captive portal.
 
-**WiFi Access Point**: The ESP32 creates a standalone WiFi network (`WIFI_AP` mode). No external router or internet connection is required. The default IP is `192.168.4.1`.
+**WiFi AP**: The ESP32 creates a standalone network (`WIFI_AP` mode) at `192.168.4.1`. No external router or internet required.
 
-**Captive Portal**: Multiple platform-specific captive portal detection endpoints are served to prevent phones from marking the network as "no internet" and auto-disconnecting:
+**Captive portal**: Platform-specific detection endpoints prevent phones from dropping the network as "no internet":
 
 | Endpoint | Platform |
 |----------|----------|
@@ -171,44 +171,66 @@ Manages the WiFi access point, HTTP server, WebSocket server, and captive portal
 | `/generate_204` | Android |
 | `/connecttest.txt` | Windows |
 
-All other unrecognized paths redirect to `http://192.168.4.1/`.
+A `DNSServer` resolves all DNS queries to the ESP32's IP, completing captive portal behaviour on all platforms. All other paths redirect to `http://192.168.4.1/`.
 
-A DNS server (`DNSServer` library) resolves all DNS queries to the ESP32's own IP, completing the captive portal behavior.
+**WebSocket** at `/ws`:
 
-**WebSocket** (`AsyncWebSocket` at `/ws`):
+Incoming commands (client → server):
 
-Incoming messages (client → server) are parsed as JSON:
+| Command | Payload | Action |
+|---------|---------|--------|
+| `zero` | — | Stores current raw reading as zero offset; resets filter |
+| `setRate` | `"value": <Hz>` | Changes sample rate (0.1–50 Hz); takes effect immediately |
+| `setFilter` | `"value": <N>` | Changes median window (1–21 samples); resets filter buffer |
 
-| Command | Action |
-|---------|--------|
-| `{"cmd":"zero"}` | Sets current raw pressure as the zero offset, resets filter |
-
-Outgoing messages (server → client) are broadcast to all connected clients at 10 Hz:
+Outgoing data frame (server → client, broadcast at the current sample rate):
 
 ```json
 {
-  "p":   25.3,    // Filtered pressure in mmHg (float, 1 decimal place)
-  "t":   36.8,    // Sensor temperature in °C
-  "bat": 78,      // Battery percentage (0–100, or -1 for USB-only)
-  "chg": false,   // Charging indicator (heuristic: voltage > 4.15 V)
-  "ts":  123456,  // millis() timestamp
-  "ok":  true,    // Sensor read succeeded
-  "ovr": false    // Sensor overrange flag
+  "p":    25.3,   // Filtered pressure in mmHg (1 decimal)
+  "t":    36.8,   // Sensor temperature in °C
+  "bat":  78,     // Battery % (0–100), or -1 = USB only
+  "chg":  false,  // Charging indicator
+  "ts":   123456, // millis() timestamp
+  "ok":   true,   // Sensor read succeeded
+  "ovr":  false,  // Sensor overrange
+  "rate": 100,    // Current sample rate in tenths-of-Hz (100 = 10 Hz, 1 = 0.1 Hz)
+  "fwin": 5       // Current filter window in samples
 }
 ```
 
-Short keys are used to minimize WebSocket frame size.
+`rate` is transmitted as **tenths-of-Hz** (integer) to represent sub-1 Hz rates such as 0.1 Hz without floating point in JSON.
 
-#### `dashboard.h`
-The complete web interface — HTML, CSS, and JavaScript — stored as a single `PROGMEM` raw string literal and served from flash memory. This avoids the need for a LittleFS filesystem partition and a separate file upload step.
+---
 
-**Key JavaScript components**:
+### `dashboard.h`
+The complete web UI — HTML, CSS, and JavaScript — stored as a single `PROGMEM` raw string literal and served directly from flash. This avoids LittleFS, partition table changes, and a separate file upload step.
 
-- **WebSocket client**: Connects to `ws://<host>/ws`, auto-reconnects after 2 s on disconnect.
-- **Chart**: Custom scrolling line chart implemented with the Canvas 2D API. Maintains a 600-sample circular buffer (60 seconds at 10 Hz). Draws grid lines, a dashed red threshold line, the pressure trace, and a translucent fill. No external charting libraries are used (eliminating the CDN dependency that would not be available on the isolated AP network).
-- **Alert system**: When pressure ≥ threshold, the display flashes red and a 880 Hz sine wave beep is generated via the Web Audio API. Beeps are rate-limited to one every 2 seconds.
-- **iOS audio unlock**: The Web Audio API requires a user gesture before audio can be played on iOS Safari. A "Start Monitoring" button is shown as a modal overlay on first load; tapping it initializes the `AudioContext` and dismisses the overlay.
-- **Threshold persistence**: The alert threshold is stored in `localStorage` so it survives page refreshes without requiring a round-trip to the ESP32.
+**Main display**:
+- Large pressure reading (mmHg), color-coded green (normal) / red (alert) / orange (overrange)
+- Status badge: NORMAL / ALERT — HIGH PRESSURE / SENSOR OVERRANGE / SENSOR ERROR
+- Sensor temperature and connection status
+
+**Chart**: Custom scrolling line chart built on the Canvas 2D API. Maintains a 600-point circular buffer (60 seconds at 10 Hz). Renders grid, dashed red threshold line, pressure trace, and fill. No external libraries — CDN resources are unavailable on the isolated AP network.
+
+**Alert system**: When pressure ≥ threshold, the screen flashes red and an 880 Hz sine wave beep is generated via the Web Audio API, rate-limited to once every 2 seconds. A **Start Monitoring** button on first load initializes the `AudioContext` to satisfy iOS Safari's user-gesture audio requirement.
+
+**Threshold**: Configurable via +/− stepper or direct input. Default 30 mmHg (standard fasciotomy criterion). Persisted in `localStorage`.
+
+**Zero button**: Sends `{"cmd":"zero"}` to the ESP32. The firmware stores the current raw reading as the pressure offset; the filter resets. Confirmation text appears briefly on the chart.
+
+**Prototyping Panel** (collapsible, labelled DEV):
+
+- *Sample Rate*: Preset buttons — 0.1 / 1 / 5 / 10 / 20 Hz. Sends `setRate` command; active button updates to reflect actual ESP32 rate on next data frame.
+- *Median Window*: Stepper in steps of 2 (1–21, always odd). Displays window size in both samples and milliseconds. Sends `setFilter` command.
+- *Battery Life Estimator*: Enter battery capacity in mAh. Computes estimated current draw and battery life using the model:
+  ```
+  draw = 130 mA (WiFi AP) + 20 mA (CPU) + rate_hz × 0.3 mA (sampling overhead)
+  life = capacity_mAh / draw_mA
+  ```
+  Updates live as sample rate or capacity changes. Note: WiFi dominates; rate has a minor effect on total draw.
+
+Both rate and filter window controls stay in sync with the ESP32 — if the page is refreshed, the incoming `rate` and `fwin` fields in the next data frame restore the UI to the actual current settings.
 
 ---
 
@@ -217,30 +239,33 @@ The complete web interface — HTML, CSS, and JavaScript — stored as a single 
 ### Prerequisites
 
 - Arduino IDE 2.x
-- Seeed ESP32 board package (add `https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json` to Additional Board Manager URLs)
-- XIAO ESP32-C5 selected as the board target
+- Seeed ESP32 board package — add to Additional Board Manager URLs:
+  ```
+  https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+  ```
 
 ### Library Installation
 
-Install the following via **Sketch → Include Library → Manage Libraries**:
+Install via **Sketch → Include Library → Manage Libraries**:
 
 | Library | Author | Notes |
 |---------|--------|-------|
 | ArduinoJson | Benoit Blanchon | Version 7.x |
-| ESPAsyncWebServer | Mathieu Carbou | Required for ESP32 Arduino core 3.x compatibility |
+| ESPAsyncWebServer | Mathieu Carbou | **Required** — use this fork for ESP32 core 3.x |
 | AsyncTCP | Mathieu Carbou | Installed as dependency of ESPAsyncWebServer |
 
-> **Important**: Use the Mathieu Carbou forks of ESPAsyncWebServer and AsyncTCP. The older me-no-dev versions are incompatible with ESP32 Arduino core 3.x and will fail to compile.
+> **Important**: The older `me-no-dev` versions of ESPAsyncWebServer and AsyncTCP are incompatible with ESP32 Arduino core 3.x and will fail to compile with `HTTP_GET not declared`.
 
 ### Flashing
 
-1. Connect the XIAO ESP32-C5 to your computer via USB-C.
+1. Connect XIAO ESP32-C5 via USB-C.
 2. Open `ICP_Monitor/ICP_Monitor.ino` in Arduino IDE.
-3. Select **Tools → Board → XIAO_ESP32C5**.
-4. Select the correct COM port under **Tools → Port**.
+3. **Tools → Board → XIAO_ESP32C5**
+4. **Tools → Port** → select the correct COM port.
 5. Click **Upload**.
 
-To verify operation, open **Tools → Serial Monitor** at 115200 baud and press the RESET button. Expected output:
+Verify with **Tools → Serial Monitor** at 115200 baud (press RESET after opening):
+
 ```
 === ICP Monitor ===
 Sensor initialized (I2C)
@@ -253,57 +278,30 @@ Ready. Connect to WiFi: ICP-Monitor
 
 ### Connecting
 
-1. On iPhone/laptop: **Settings → WiFi → ICP-Monitor** (password: `pressure`)
-2. Safari/browser opens automatically via captive portal, or navigate to `http://192.168.4.1`
+1. **Settings → WiFi → ICP-Monitor** (password: `pressure`)
+2. Safari opens automatically, or navigate to `http://192.168.4.1`
 3. Tap **Start Monitoring** to enable audio alerts
-4. Live pressure readings begin immediately
+4. Live readings begin immediately
 
 ---
 
-## Using the Dashboard
+## Clinical Use
 
 ### Zeroing (Tare)
 
-Before measurement, expose the sensor to atmospheric pressure (needle not yet inserted) and tap the **ZERO** button. The current reading is stored as the offset; all subsequent readings are displayed relative to zero. A "(zeroed)" confirmation appears briefly on the chart.
-
-The zero offset is held in RAM and resets when the device is power-cycled. Re-zero at the start of each procedure.
+Before inserting the needle, expose the sensor to atmosphere and tap **ZERO**. The current reading is stored as the offset; all subsequent values are displayed relative to zero. The offset resets on power cycle — re-zero at the start of each procedure.
 
 ### Alert Threshold
 
-The default threshold is **30 mmHg**, the standard clinical criterion for compartment syndrome requiring fasciotomy. Adjust with the +/− buttons or by typing directly in the field. The threshold is saved to browser `localStorage` and persists across page refreshes.
+Default: **30 mmHg** (standard compartment syndrome fasciotomy criterion). Adjust with +/− or direct input. Persists in browser `localStorage` across refreshes.
 
-When pressure exceeds the threshold:
-- The pressure display turns red
-- The status badge pulses with "ALERT — HIGH PRESSURE"
-- A 880 Hz beep sounds every 2 seconds (requires "Start Monitoring" to have been tapped)
+When pressure ≥ threshold:
+- Pressure display turns red with pulsing **ALERT — HIGH PRESSURE** badge
+- 880 Hz audio beep every 2 seconds
 
 ### Overrange
 
-If the sensor's output saturates (pressure above 1 PSI / 51.7 mmHg), the display shows **"OVR"** in orange. This indicates the physical pressure exceeds the sensor's measurement range. The chart pauses during overrange conditions.
-
----
-
-## Signal Processing Detail
-
-Raw sensor readings at 10 Hz pass through a median filter before display:
-
-```
-Raw ADC counts → PSI → mmHg → subtract zero offset
-                                     │
-                              Median Filter
-                              (5-sample window, 500 ms at 10 Hz)
-                                     │
-                              Displayed value
-```
-
-**How the median filter works**: A circular buffer of the 5 most recent samples is maintained. On each new sample, a sorted copy of the buffer is produced (insertion sort, ≤10 comparisons) and the middle element is returned as the output.
-
-**Why median over alternatives**:
-- A single spike can only become the median if it is 3 or more of the last 5 samples — a single bad I2C read is invisible to the output.
-- Unlike threshold-based spike rejection, there is no parameter to tune and no risk of suppressing a real rapid pressure change — if the pressure genuinely rises, the majority of the buffer rises with it and the median follows immediately.
-- Unlike a rolling average, spikes do not bleed proportionally into the output; they are simply voted out.
-
-To adjust the window size, modify `FILTER_WINDOW` in `config.h` (keep it odd) and re-flash.
+If the sensor saturates (pressure > 1 PSI / 51.7 mmHg), the display shows **OVR** in orange. The chart pauses until pressure returns within range.
 
 ---
 
@@ -311,42 +309,47 @@ To adjust the window size, modify `FILTER_WINDOW` in `config.h` (keep it odd) an
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
-| "Sensor not found" on Serial | Wiring issue or missing pull-ups | Check SDA→D4, SCL→D5; add 4.7 kΩ pull-ups |
-| Pressure reads ~−26 mmHg (not zeroed) | Atmospheric offset not cleared | Tap ZERO button before measurement |
+| Sensor ERROR on display | Wiring issue or missing pull-ups | Check SDA→D4, SCL→D5; add 4.7 kΩ pull-ups |
+| Pressure reads ~−26 mmHg | Not zeroed | Tap ZERO before measurement |
 | Battery shows "USB" | No LiPo connected | Connect 3.7V LiPo to B+/B− pads |
-| Battery shows 0% | Wrong ADC pin or no divider | Check raw ADC value in Serial Monitor at startup |
+| Battery shows 0% | Wrong ADC pin / no divider | Check raw mV in Serial Monitor at startup |
 | Dashboard won't load | Phone dropped AP WiFi | Reconnect to "ICP-Monitor" in WiFi settings |
-| No beep on alert | iOS audio not unlocked | Ensure "Start Monitoring" was tapped |
-| Compilation error: `HTTP_GET` not declared | Wrong ESPAsyncWebServer version | Delete old library, install Mathieu Carbou fork |
+| No alert beep | iOS audio locked | Tap "Start Monitoring" first |
+| `HTTP_GET` compile error | Wrong ESPAsyncWebServer fork | Remove old library; install Mathieu Carbou fork |
 
 ---
 
 ## Configuration Reference
 
-All parameters are in `ICP_Monitor/config.h`:
+`ICP_Monitor/config.h` — defaults only; sample rate and filter window are overridable at runtime from the Prototyping Panel.
 
 ```cpp
 // I2C
-#define SDA_PIN              D4
-#define SCL_PIN              D5
-#define I2C_ADDR             0x28
+#define SDA_PIN     D4
+#define SCL_PIN     D5
+#define I2C_ADDR    0x28
 
 // Sensor transfer function (do not modify — matches ABP2 datasheet)
-const float P_MIN   = 0.0;
-const float P_MAX   = 1.0;
-const float OUT_MIN = 1677722.0;
-const float OUT_MAX = 15099494.0;
-const float PSI_TO_MMHG = 51.7149;
+const float P_MIN        = 0.0;
+const float P_MAX        = 1.0;
+const float OUT_MIN      = 1677722.0;
+const float OUT_MAX      = 15099494.0;
+const float PSI_TO_MMHG  = 51.7149;
 
 // Filter
-#define FILTER_WINDOW        10      // samples (1 s at 10 Hz)
-#define SPIKE_THRESHOLD_MMHG 15.0f  // mmHg
+#define FILTER_MAX_WINDOW     21    // Hard array size limit (must be odd)
+#define FILTER_DEFAULT_WINDOW  5    // Window on startup
 
 // Timing
-#define SENSOR_INTERVAL_MS   100    // 10 Hz
-#define BATTERY_INTERVAL_MS  5000   // 0.2 Hz
+#define SENSOR_INTERVAL_MS   100   // Default 10 Hz (runtime adjustable)
+#define BATTERY_INTERVAL_MS  5000  // 0.2 Hz (fixed)
 
 // WiFi
 #define AP_SSID     "ICP-Monitor"
 #define AP_PASSWORD "pressure"
+
+// Battery thresholds (3.7V LiPo)
+const float BAT_VOLT_FULL     = 4.2;
+const float BAT_VOLT_EMPTY    = 3.0;
+const float BAT_VOLT_CHARGING = 4.15;
 ```
