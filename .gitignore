@@ -1,0 +1,18 @@
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Arduino IDE temp files
+*.bak
+*.orig
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude internal plan files
+.claude/
