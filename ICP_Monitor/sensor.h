@@ -3,7 +3,8 @@
 
 #include <Arduino.h>
 
-enum SensorResult {
+enum SensorResult
+{
   SENSOR_OK,
   SENSOR_ERROR,      // I2C failure / bad status byte
   SENSOR_OVERRANGE,  // Pressure above sensor max (counts saturated high)

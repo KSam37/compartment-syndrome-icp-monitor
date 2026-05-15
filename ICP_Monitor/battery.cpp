@@ -1,37 +1,41 @@
 #include "battery.h"
-#include "config.h"
+#include <Arduino.h>
 
-void batteryInit() {
-  analogReadResolution(12);
-  pinMode(BAT_ADC_PIN, INPUT);
+static float smoothedVoltage = -1.0;
 
-  // Print raw ADC value at startup to help debug pin/divider issues
-  delay(100);
-  uint32_t raw = analogReadMilliVolts(BAT_ADC_PIN);
-  Serial.printf("[Battery] Raw ADC on A0: %lu mV  (x2 = %.2f V)\n", raw, (raw * 2.0) / 1000.0);
+void batteryInit()
+{
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+    delay(100);
 }
 
-float readBatteryVoltage() {
-  // Take 16 samples and average for stability
-  uint32_t sum = 0;
-  for (int i = 0; i < 16; i++) {
-    sum += analogReadMilliVolts(BAT_ADC_PIN);
-  }
-  float avg_mv = sum / 16.0;
+float readBatteryVoltage()
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++)
+    {
+        sum += analogReadMilliVolts(A0);
+        delay(1);
+    }
+    
+    float avg_mv = sum / 16.0;
+    float voltage = (avg_mv * 2.0) / 1000.0;
 
-  // XIAO ESP32-C5 has a 1:2 resistor divider on the battery pin
-  float voltage = (avg_mv * 2.0) / 1000.0;
-  return voltage;
+    if (smoothedVoltage < 0)
+    {
+        smoothedVoltage = voltage;  // seed on first call — no smoothing needed
+        return smoothedVoltage;     // return immediately, already accurate
+    }
+    
+    smoothedVoltage = (0.2 * voltage) + (0.8 * smoothedVoltage);
+    return smoothedVoltage;
 }
 
-// Returns 0-100, or -1 if no battery detected (USB only)
-int batteryPercent(float voltage) {
-  if (voltage < 2.5) return -1;  // No battery / floating pin
-  if (voltage >= BAT_VOLT_FULL)  return 100;
-  if (voltage <= BAT_VOLT_EMPTY) return 0;
-  return (int)(((voltage - BAT_VOLT_EMPTY) / (BAT_VOLT_FULL - BAT_VOLT_EMPTY)) * 100.0);
-}
-
-bool isCharging(float voltage) {
-  return voltage > BAT_VOLT_CHARGING;
+int batteryPercent(float voltage)
+{
+    if (voltage < 2.5) return -1;
+    if (voltage >= BAT_VOLT_FULL)  return 100;
+    if (voltage <= BAT_VOLT_EMPTY) return 0;
+    return (int)(((voltage - BAT_VOLT_EMPTY) / (BAT_VOLT_FULL - BAT_VOLT_EMPTY)) * 100.0); //assuming a linear relationship
 }

@@ -2,127 +2,184 @@
 #include "sensor.h"
 #include "battery.h"
 #include "filter.h"
-#include "webserver.h"
+#include "esp_pm.h"
+#include "esp_system.h"
+#include "esp_sleep.h"
 
-// ── Runtime-adjustable settings ──
-volatile uint16_t sensorIntervalMs = SENSOR_INTERVAL_MS;  // adjusted via dashboard
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// ── Zero (tare) offset ──
-float zeroOffsetMmhg = 0.0;
-volatile bool zeroRequested = false;
+#define LED_BUILTIN 15
+#define DEEP_SLEEP_SECONDS 55  // sleep 55s so wake + connect + send fits in 60s window
 
-// ── Last valid readings ──
-float lastPressureMmhg = 0.0;
-float lastTempC = 0.0;
-bool  lastSensorOk = false;
-bool  lastOverrange = false;
+// Zero offset — stored in RTC memory so it survives deep sleep
+RTC_DATA_ATTR float zeroOffsetMmhg = 0.0;
+RTC_DATA_ATTR int   bootCount = 0;
 
-// ── Battery state ──
-int  batPercent = -1;
-bool batCharging = false;
+// Runtime state
+volatile bool zeroRequested   = false;
+volatile bool clientConnected = false;
+volatile bool dataSent        = false;
 
-// ── Timing ──
-unsigned long lastSensorRead = 0;
-unsigned long lastBatteryRead = 0;
+BLECharacteristic *pCharacteristic;
+BLECharacteristic *pCmdCharacteristic;
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== ICP Monitor ===");
+class CmdCallbacks : public BLECharacteristicCallbacks 
+{
+    void onWrite(BLECharacteristic *pChar) 
+    {
+        String val = pChar->getValue();
+        if (val == "ZERO") 
+        {
+            zeroRequested = true;
+            Serial.println("Zero command received via BLE");
+        }
+    }
+};
 
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);  // HIGH = off (active low on XIAO)
+class ServerCallbacks : public BLEServerCallbacks 
+{
+    void onConnect(BLEServer* pServer) 
+    {
+        clientConnected = true;
+        Serial.println("BLE client connected");
+    }
+    void onDisconnect(BLEServer* pServer) 
+    {
+        clientConnected = false;
+        Serial.println("BLE client disconnected");
+    }
+};
 
-  sensorInit();
-  filterInit();
-  Serial.println("Sensor initialized (I2C)");
-
-  batteryInit();
-  Serial.println("Battery monitor initialized");
-
-  setupWiFiAP();
-
-  setZeroCallback([]() {
-    zeroRequested = true;
-  });
-
-  setRateCallback([](uint16_t intervalMs) {
-    sensorIntervalMs = intervalMs;
-  });
-
-  setFilterCallback([](uint8_t window) {
-    filterSetWindow(window);  // filterSetWindow resets the buffer internally
-  });
-
-  setupWebServer();
-
-  Serial.println("Ready. Connect to WiFi: " AP_SSID);
-  Serial.println("Open browser to: http://192.168.4.1");
+void sendBLE(float pressure, float temp, int bat) 
+{
+    if (!clientConnected) return;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f,%.2f,%d", pressure, temp, bat);
+    pCharacteristic->setValue(buf);
+    pCharacteristic->notify();
+    dataSent = true;
+    Serial.printf("Sent: %s\n", buf);
 }
 
-void loop() {
-  processDNS();
+void setup() 
+{
+    Serial.begin(115200);
+    delay(500);
 
-  unsigned long now = millis();
+    bootCount++;
+    Serial.printf("\n=== ICP Monitor | Boot #%d ===\n", bootCount);
+    Serial.printf("Reset reason: %d\n", esp_reset_reason());
 
-  // ── Read sensor at runtime-adjustable rate ──
-  if (now - lastSensorRead >= sensorIntervalMs) {
-    lastSensorRead = now;
-
-    float psi = 0, tempC = 0;
-    SensorResult result = sensorRead(psi, tempC);
-
-    lastOverrange = (result == SENSOR_OVERRANGE);
-    lastSensorOk  = (result == SENSOR_OK);
-
-    if (result == SENSOR_OK) {
-      float rawMmhg = psiToMmhg(psi);
-
-      if (zeroRequested) {
-        zeroOffsetMmhg = rawMmhg;
-        zeroRequested = false;
-        filterInit();
-        Serial.printf("Zeroed. Offset = %.1f mmHg\n", zeroOffsetMmhg);
-      }
-
-      float offsetMmhg = rawMmhg - zeroOffsetMmhg;
-      lastPressureMmhg = filterSample(offsetMmhg);
-      lastTempC = tempC;
-    }
-
-    // Compute Hz from current interval for the broadcast payload (float * 100 to preserve 0.1)
-    // Sent as integer tenths-of-Hz so JSON stays simple: 1 = 0.1 Hz, 10 = 1 Hz, 100 = 10 Hz
-    uint16_t rateTenths = (uint16_t)round(10000.0f / sensorIntervalMs);
-
-    broadcastSensorData(lastPressureMmhg, lastTempC,
-                        batPercent, batCharging,
-                        lastSensorOk, lastOverrange,
-                        rateTenths, filterGetWindow());
-
-    // Blink LED on each measurement (active low on XIAO)
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(20);
+    pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, HIGH);
 
-    // Serial debug — print every ~1 s regardless of sample rate
-    static uint32_t lastDbgMs = 0;
-    if (now - lastDbgMs >= 1000) {
-      lastDbgMs = now;
-      Serial.printf("P: %.1f mmHg | T: %.1f C | Bat: %d%% %s | %s | %.1f Hz | fwin=%d\n",
-        lastPressureMmhg, lastTempC, batPercent,
-        batCharging ? "(chg)" : "",
-        lastOverrange ? "OVERRANGE" : (lastSensorOk ? "OK" : "ERROR"),
-        rateTenths / 10.0f, filterGetWindow());
+    // Read sensor
+    sensorInit();
+    filterInit();
+
+    float pressure_psi = 0, temp_c = 0;
+    float pressureMmhg = 0;
+    bool  sensorOk = false;
+
+    delay(200);  // let I2C bus settle before first read
+    SensorResult result = sensorRead(pressure_psi, temp_c);
+    Serial.printf("[Sensor] result=%d\n", result);
+
+    if (result == SENSOR_OK) 
+    {
+        float rawMmhg = psiToMmhg(pressure_psi);
+
+        if (zeroRequested) 
+        {
+            zeroOffsetMmhg = rawMmhg;
+            zeroRequested  = false;
+            Serial.printf("Zeroed. Offset = %.1f mmHg\n", zeroOffsetMmhg);
+        }
+
+        pressureMmhg = filterSample(rawMmhg - zeroOffsetMmhg);
+        sensorOk = true;
     }
-  }
 
-  // ── Read battery every 5 seconds ──
-  if (now - lastBatteryRead >= BATTERY_INTERVAL_MS) {
-    lastBatteryRead = now;
-    float voltage = readBatteryVoltage();
-    batPercent = batteryPercent(voltage);
-    batCharging = isCharging(voltage);
-  }
+    // Read battery
+    batteryInit();
+    delay(100);
+    float voltage    = readBatteryVoltage();
+    int   batPercent = batteryPercent(voltage);
 
-  cleanupClients();
+    Serial.printf("P: %.1f mmHg | T: %.1f C | Bat: %d%% | %s\n",
+        pressureMmhg, temp_c, batPercent,
+        sensorOk ? "OK" : "ERROR");
+
+    // ── Init BLE ──
+    delay(200);  // settle before BLE spike
+    BLEDevice::init("ICP_Monitor");
+    BLEDevice::setPower(ESP_PWR_LVL_N12);
+
+    BLEServer *server = BLEDevice::createServer();
+    server->setCallbacks(new ServerCallbacks());
+
+    BLEService *service = server->createService(
+        BLEUUID("12345678-1234-1234-1234-123456789abc"), 32);
+
+    pCharacteristic = service->createCharacteristic(
+        "abcd1234-5678-90ab-cdef-123456789abd",
+        BLECharacteristic::PROPERTY_NOTIFY);
+    pCharacteristic->addDescriptor(new BLE2902());
+
+    pCmdCharacteristic = service->createCharacteristic(
+        "abcd1234-5678-90ab-cdef-123456789abe",
+        BLECharacteristic::PROPERTY_WRITE);
+    pCmdCharacteristic->setCallbacks(new CmdCallbacks());
+
+    service->start();
+
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID("12345678-1234-1234-1234-123456789abc");
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    adv->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    Serial.println("Advertising...");
+
+    // ── Wait up to 8 seconds for iOS to connect and receive data ──
+    unsigned long start = millis();
+    while (millis() - start < 8000) 
+    {
+        if (clientConnected && !dataSent) 
+        {
+            delay(500);  // small gap after connect before sending
+            sendBLE(pressureMmhg, temp_c, batPercent);
+        }
+        if (dataSent) 
+        {
+            delay(300);  // let iOS process before we disconnect
+            break;
+        }
+        delay(50);
+    }
+
+    if (!dataSent)
+    {
+        Serial.println("No client connected — sleeping anyway");
+    }
+
+    // ── Blink LED to signal going to sleep ──
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(100);
+    digitalWrite(LED_BUILTIN, HIGH);
+
+    // ── Deep sleep ──
+    Serial.printf("Sleeping for %d seconds...\n", DEEP_SLEEP_SECONDS);
+    Serial.flush();
+    BLEDevice::deinit(true);
+    esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+void loop()
+{
+    // Never runs — deep sleep restarts from setup() on every wake
 }

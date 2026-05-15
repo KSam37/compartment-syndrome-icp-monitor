@@ -6,13 +6,15 @@ static uint8_t activeWindow = FILTER_DEFAULT_WINDOW;
 static uint8_t writeIdx = 0;
 static uint8_t count    = 0;
 
-void filterInit() {
+void filterInit()
+{
   memset(buf, 0, sizeof(buf));
   writeIdx = 0;
   count    = 0;
 }
 
-void filterSetWindow(uint8_t n) {
+void filterSetWindow(uint8_t n)
+{
   if (n < 1) n = 1;
   if (n > FILTER_MAX_WINDOW) n = FILTER_MAX_WINDOW;
   if (n % 2 == 0) n++;  // Enforce odd so there is always a single middle element
@@ -20,11 +22,13 @@ void filterSetWindow(uint8_t n) {
   filterInit();
 }
 
-uint8_t filterGetWindow() {
+uint8_t filterGetWindow()
+{
   return activeWindow;
 }
 
-float filterSample(float newSample) {
+float filterSample(float newSample)
+{
   buf[writeIdx] = newSample;
   writeIdx = (writeIdx + 1) % activeWindow;
   if (count < activeWindow) count++;
@@ -32,10 +36,12 @@ float filterSample(float newSample) {
   // Copy active portion into temp array and insertion-sort it
   float tmp[FILTER_MAX_WINDOW];
   memcpy(tmp, buf, count * sizeof(float));
-  for (uint8_t i = 1; i < count; i++) {
+  for (uint8_t i = 1; i < count; i++)
+  {
     float key = tmp[i];
     int8_t j  = i - 1;
-    while (j >= 0 && tmp[j] > key) {
+    while (j >= 0 && tmp[j] > key)
+    {
       tmp[j + 1] = tmp[j];
       j--;
     }

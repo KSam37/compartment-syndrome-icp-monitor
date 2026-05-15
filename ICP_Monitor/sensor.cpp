@@ -2,11 +2,15 @@
 #include "config.h"
 #include <Wire.h>
 
-void sensorInit() {
-  Wire.begin(SDA_PIN, SCL_PIN);
+
+void sensorInit() 
+{
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setTimeOut(50);  // 50ms timeout — prevents I2C hang
 }
 
-SensorResult sensorRead(float &pressure_psi, float &temp_c) {
+SensorResult sensorRead(float &pressure_psi, float &temp_c)
+{
   // Send measurement command
   Wire.beginTransmission(I2C_ADDR);
   Wire.write(0xAA);
@@ -20,7 +24,8 @@ SensorResult sensorRead(float &pressure_psi, float &temp_c) {
 
   // Request 7 bytes: 1 status + 3 pressure + 3 temperature
   Wire.requestFrom((uint8_t)I2C_ADDR, (uint8_t)7);
-  if (Wire.available() != 7) {
+  if (Wire.available() != 7)
+  {
     return SENSOR_ERROR;
   }
 
@@ -33,7 +38,8 @@ SensorResult sensorRead(float &pressure_psi, float &temp_c) {
   uint8_t t3 = Wire.read();
 
   // Status 0x40 = powered on, not busy
-  if (status != 0x40) {
+  if (status != 0x40)
+  {
     return SENSOR_ERROR;
   }
 
@@ -51,6 +57,7 @@ SensorResult sensorRead(float &pressure_psi, float &temp_c) {
   return SENSOR_OK;
 }
 
-float psiToMmhg(float psi) {
+float psiToMmhg(float psi)
+{
   return psi * PSI_TO_MMHG;
 }
