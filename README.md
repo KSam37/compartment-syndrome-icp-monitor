@@ -41,13 +41,18 @@ D5 (SCL)      ──────►  SCL
 
 ```
 ICP_Monitor/
-├── ICP_Monitor.ino     Main firmware — setup/loop, orchestration
-├── config.h            Pin definitions, constants, and default parameters
-├── sensor.h/.cpp       Honeywell ABP2 I2C driver
-├── filter.h/.cpp       5-sample median filter (runtime-adjustable window)
-├── battery.h/.cpp      Battery voltage monitoring
-├── webserver.h/.cpp    WiFi AP, HTTP server, WebSocket, captive portal
-└── dashboard.h         Complete web UI embedded as a PROGMEM string literal
+├── ICP_Monitor.ino                  Main firmware — setup/loop, orchestration
+├── config.h                         Pin definitions, constants, and default parameters
+├── sensor.h/.cpp                    Honeywell ABP2 I2C driver
+├── filter.h/.cpp                    5-sample median filter (runtime-adjustable window)
+├── battery.h/.cpp                   Battery voltage monitoring
+├── compartmentSyndromeApp.swift     Creates Xcode project for app
+├── ContentView.swift                Complete app UI 
+├── BLEManager.swift                 Sends data from pressure transducer to app
+├── info.plist                       Set up for phone in Xcode
+├── webserver.h/.cpp                 WiFi AP, HTTP server, WebSocket, captive portal
+└── dashboard.h                      Complete web UI embedded as a PROGMEM string literal
+ 
 ```
 
 ### Data Flow
@@ -67,11 +72,10 @@ Honeywell ABP2 (I2C)
   ICP_Monitor.ino       → build JSON, broadcast via WebSocket
         │
         ▼
-  webserver.cpp
-  ws.textAll(json)      → push to all connected browser clients
+  BLEManager.swift
         │
         ▼
-  dashboard.h (JS)      → update display, chart, alerts, prototyping panel
+ ContentView.swift      → update display, chart, alerts, prototyping panel
 ```
 
 ---
@@ -158,6 +162,48 @@ The board has a 1:2 resistor voltage divider (two 100 kΩ) connecting battery+ t
 
 ---
 
+### `BLEManager.swift` ###
+The core communication engine that manages the CoreBluetooth lifecycle and data processing. It acts as the central manager, handling device discovery, connection persistence, and byte-stream parsing.
+
+- **Connection Logic:** Automatically scans for a specific Service UUID (1234...9abc) on launch. It includes auto-reconnect logic; if the peripheral disconnects, the manager immediately attempts to re-establish the link or resumes scanning.
+
+- **Data Parsing:** Receives UTF-8 encoded strings via notifications. It expects a comma-separated format: Pressure,Temperature,Battery.
+
+- **Persistent Logging:** Implements a FileHandle system to log real-time data to ICP_Data_Log.csv within the app's document directory. Data is synchronized (flushed to disk) immediately after each write to prevent data loss.
+
+- **Trend Analysis:** Calculates a rolling "1-Hour Trend" by comparing the current pressure value against the first available data point within a 60-minute lookback window.
+
+- **Safety Alarms:** Monitors pressure against a user-definable threshold. When exceeded, it triggers AudioServicesPlaySystemSound for foreground alerts and schedules UNMutableNotificationContent (Critical Alerts) to bypass silent mode.
+---
+### `ContentView.swift`###
+A SwiftUI-based dashboard providing real-time visualization and control of the ICP monitoring session.
+
+- **Live Charting:** Uses the Charts framework to render a LineMark graph of pressure history. The X-axis is dynamically scaled and formatted to show time intervals in minutes.
+
+- **Control Interface:**
+  - **Zero/Tare:** A confirmation-guarded button that sends a "ZERO" command to the ESP32 and clears local history to establish a new baseline.
+
+  - **Alarm Configuration:** A toggle and decimal-pad input for setting the mmHg threshold.
+
+**Data Export:** A "Share" utility that flushes the active FileHandle and copies the internal CSV log to a temporary URL for export via UIActivityViewController (Email, AirDrop, Files).
+
+**State Feedback:** Visualizes connection status via a StatusPill and battery health through a color-coded MetricCard.
+
+---
+### `compartmentSyndromeApp.swift & NotificationDelegate` ###
+Handles the application lifecycle and specialized notification behavior.
+
+- **Foreground Notifications:** Implements UNUserNotificationCenterDelegate to ensure that critical pressure alerts appear as banners even when the application is actively open and in focus.
+- **Initialization:** Requests user permissions for alerts, sounds, and badges immediately upon first launch to ensure the safety alarm system is functional.
+---
+### `Info.plist` ###
+Configures system-level permissions and file handling capabilities.
+
+- **File Sharing:** UIFileSharingEnabled is set to true, allowing the user to access the ICP_Data_Log.csv directly through the iOS "Files" app or iTunes File Sharing.
+
+- **UTI Declarations:** Explicitly declares support for the public.comma-separated-values (CSV) type to ensure the iOS Share Sheet correctly identifies and handles exported data logs.
+
+---
 ### `webserver.h/.cpp`
 Manages the WiFi access point, HTTP server, WebSocket, and captive portal.
 
@@ -243,6 +289,7 @@ Both rate and filter window controls stay in sync with the ESP32 — if the page
   ```
   https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
   ```
+- Xcode
 
 ### Library Installation
 
@@ -276,12 +323,16 @@ Web server started on port 80
 Ready. Connect to WiFi: ICP-Monitor
 ```
 
+### App
+Open the swift files and info.plist via Xcode. To enable Bluetooth, click on the project name --> Info --> hover on any of the keys and click on the plus. Add Privacy - Bluetooth Always Usage Description as the key and for the value, add any string ("Needed to read pressure sensor")
+
+Plug in phone and where it says "Any iOS Device (arm64)", select the device and build the project.
+
 ### Connecting
 
-1. **Settings → WiFi → ICP-Monitor** (password: `pressure`)
-2. Safari opens automatically, or navigate to `http://192.168.4.1`
-3. Tap **Start Monitoring** to enable audio alerts
-4. Live readings begin immediately
+1. Open the application
+2. Ensure that the phone and device are connected by ensuring the connected circle on the top of the app is green. If it is not, press the reset button the arduino once
+3. Live readings begin immediately
 
 ---
 
