@@ -46,12 +46,14 @@ ICP_Monitor/
 ├── sensor.h/.cpp                    Honeywell ABP2 I2C driver
 ├── filter.h/.cpp                    5-sample median filter (runtime-adjustable window)
 ├── battery.h/.cpp                   Battery voltage monitoring
+├── webserver.h/.cpp                 WiFi AP, HTTP server, WebSocket, captive portal
+└── dashboard.h                      Complete web UI embedded as a PROGMEM string literal
+
+ICP_App/
 ├── compartmentSyndromeApp.swift     Creates Xcode project for app
 ├── ContentView.swift                Complete app UI 
 ├── BLEManager.swift                 Sends data from pressure transducer to app
-├── info.plist                       Set up for phone in Xcode
-├── webserver.h/.cpp                 WiFi AP, HTTP server, WebSocket, captive portal
-└── dashboard.h                      Complete web UI embedded as a PROGMEM string literal
+└── info.plist                       Set up for phone in Xcode
  
 ```
 
